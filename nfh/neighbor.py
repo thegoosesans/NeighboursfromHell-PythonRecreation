@@ -10,6 +10,8 @@ from __future__ import annotations
 import random
 from typing import List, Optional, Set
 
+from .peep import PeepScript
+
 STAY = (3.0, 7.0)               # seconds he lingers in a room
 SPOT_DIST = 170                 # Woody is seen when he is this close (px) and not hidden
 CAUGHT_WAIT = 2.5               # seconds until the level restarts after Woody was caught
@@ -30,6 +32,7 @@ class NeighborAI:
         lay = world.level.layout
         self.level_angry = (lay.angrytime if lay else 0) / ANIM_FPS
         self.triggers = world.level.triggers.get("neighbor", {})
+        self.peep = PeepScript(self) if getattr(world.level, "name", "") == "level_peep" else None
 
     # ---- events from the world -----------------------------------------------------------
     def noise(self, room: Optional[str], level: int = 1):
@@ -70,6 +73,17 @@ class NeighborAI:
         name = "slip3" if self.actor.facing == 3 else "slip1"
         if self._anim_ok(name):
             yield from self._play(name)
+        for _ in range(12):
+            yield
+
+    def fall_for(self, obj: str):
+        """He falls for trick `obj` once: its quota is scored and his rage starts (tricks.xml)."""
+        if obj in self.victims:
+            return
+        self.victims.add(obj)
+        trick = self.w.level.tricks.get(obj)
+        self.w.score += trick.quotas[0] if trick else 0
+        self._enrage(trick.angrytime if trick and trick.angrytime else None)
         for _ in range(12):
             yield
 
@@ -165,6 +179,9 @@ class NeighborAI:
         if self.noise_room is not None:
             room, self.noise_room = self.noise_room, None
             a.script = self._visit(room, *self._centre(room))
+            return
+        if self.peep is not None:                      # level_peep: the original's scripted routine
+            a.script = self.peep.step()
             return
         self.timer -= dt
         if self.timer > 0:
