@@ -6,12 +6,9 @@ object name used in gfxdata.xml plus the image name, so objects are resolved wit
 PNGs are preferred, the original .tga (decoded with nfh.tga) is the fallback.
 """
 from __future__ import annotations
-import io
 import os
 import wave
 from typing import Dict, Iterable, List, Optional, Tuple
-
-from .source import SEP, archive, read_path
 
 SOUND_EXTS = (".wav", ".ogg", ".mp3")
 
@@ -28,12 +25,6 @@ class _Index:
         self.full: Dict[str, str] = {}
         self.base: Dict[str, str] = {}
         if not root:
-            return
-        if os.path.isfile(root):                          # a .bnd / .zip archive: index its entries
-            for n in archive(root).names():
-                if n.endswith(exts):
-                    self.full[_norm(n)] = root + SEP + n
-                    self.base.setdefault(_norm(os.path.basename(n)), root + SEP + n)
             return
         # accept zip-style nesting (NFH1/NFH1/...) by indexing relative to the deepest common root
         for d, _dirs, files in os.walk(root):
@@ -73,7 +64,7 @@ class SpriteBank:
         img = None
         p = self.png.find(image, folder)
         if p:
-            img = Image.open(io.BytesIO(read_path(p))).convert("RGBA")
+            img = Image.open(p).convert("RGBA")
         else:
             p = self.tga.find(image, folder)
             if p:
@@ -95,14 +86,11 @@ class SoundBank:
     def path(self, name: str) -> Optional[str]:
         return self.index.find(name)
 
-    def read(self, path: str) -> bytes:
-        return read_path(path)
-
     def load_wav(self, name: str):
         p = self.path(name)
         if p is None or not p.lower().endswith(".wav"):
             return None
-        with wave.open(io.BytesIO(read_path(p)), "rb") as w:
+        with wave.open(p, "rb") as w:
             return w.getparams(), w.readframes(w.getnframes())
 
     def music(self) -> List[str]:

@@ -13,10 +13,11 @@ Controls
     Tab                overview of the whole house    PgUp / PgDn   previous / next level
     , and .            previous / next animation of the selected thing      Enter   play it
     Space              pause      M   music on/off      R   restart level      Esc   quit
+    hold Shift         sneak (slow, silent) - footsteps wake the sleeping neighbour and the pets
+    N                  neighbour and pets AI on / off (to look around in peace)
 """
 from __future__ import annotations
 import argparse
-import io
 import os
 import sys
 
@@ -27,16 +28,13 @@ import pygame
 
 from nfh import level_names, load_game, load_level
 from nfh.assets import SoundBank, SpriteBank
-from nfh.engine import World
+from nfh.engine import ANIM_FPS, World
 from nfh.render import render_world
-from nfh.ui import Hud
-from nfh import data as game_data
-from nfh.source import Source, find_data_dir
-from nfh.menu import Menu, Progress
-from nfh import level_sets
+from nfh import gui
 
-HUD_H = 0                          # the level fills the window; the interface (nfh.ui.Hud) overlays its bottom edge
-BAR_H = 0
+HUD_H = 56
+BAR_H = 136                       # original-style HUD / inventory panel at the bottom
+SLOT_W = 84
 VIEW_H = 640                       # level pixels shown vertically (the original shows ~800x600)
 
 
@@ -60,22 +58,18 @@ class Viewer:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont(None, 22)
         self.big = pygame.font.SysFont(None, 28)
-        self.small = pygame.font.SysFont(None, 19)
-        self.hud = Hud(bank, self.font, self.small)
         self.sound_cache = {}
         self.music_on = False
         self.follow = True
         self.view_h = VIEW_H
         self.icon_cache = {}
-        self.info = {l.name: l for st in level_sets() for l in st.levels}
-        self.menu = Menu(bank, Progress(os.path.join(os.path.expanduser("~"), ".nfh_python")))
-        self.state = "menu"                       # menu | game
+        self.hud_state = gui.HudState()
+        self.toast = None
         self._load()
 
     # ---- level handling -----------------------------------------------------
     def _load(self):
         w = self.world = World(load_level(self.names[self.level_idx]), self.bank)
-        self.elapsed = 0.0
         self.mode = "camera"                      # camera (scrolling, follows Woody) | overview
         self.selected = None
         self.sel_anim = 0
@@ -89,17 +83,6 @@ class Viewer:
             door = w.door("fro/anc")              # intro: Woody walks into the house
             if door is not None and w.woody.room == "fro":
                 w.woody.use_door(door)
-
-    def _level_over(self) -> bool:
-        """Time is up (leveldata `time` in animation steps) or every point is earned -> results screen."""
-        info = self.info.get(self.names[self.level_idx])
-        limit = (info.time / 12.0) if info and info.time else 0
-        if self.world.score >= 100 or (limit and self.elapsed >= limit):
-            self.menu.show_result(self.names[self.level_idx], min(100, int(self.world.score)),
-                                  info.minquota if info else 0)
-            self.menu.started, self.state = False, "menu"
-            return True
-        return False
 
     def _woody_point(self):
         wd = self.world.woody
@@ -115,7 +98,7 @@ class Viewer:
             for p in self.sounds.music():
                 if "ingame1_normal" in p:
                     try:
-                        pygame.mixer.music.load(io.BytesIO(self.sounds.read(p)), "mp3")
+                        pygame.mixer.music.load(p)
                         pygame.mixer.music.play(-1)
                     except pygame.error:
                         pass
@@ -130,7 +113,7 @@ class Viewer:
         if snd is None and name not in self.sound_cache:
             path = self.sounds.path(name)
             try:
-                snd = pygame.mixer.Sound(file=io.BytesIO(self.sounds.read(path))) if path else None
+                snd = pygame.mixer.Sound(path) if path else None
             except pygame.error:
                 snd = None
             self.sound_cache[name] = snd
@@ -158,16 +141,37 @@ class Viewer:
         return (self.origin[0] + (x - self.rect[0]) * self.scale,
                 self.origin[1] + (y - self.rect[1]) * self.scale)
 
-    def _in_hud(self, pos):
-        return self.hud.zone(*self.screen.get_size()).collidepoint(pos)
+    def _icon(self, item: str, state: str):
+        key = (item, state)
+        if key not in self.icon_cache:
+            img = self.bank.get(f"I_{item}_{state}", "gui/inv")
+            if img is None and state != "norm":
+                img = self.bank.get(f"I_{item}_norm", "gui/inv")
+            self.icon_cache[key] = (pygame.image.frombuffer(img.tobytes(), img.size, "RGBA")
+                                    if img is not None else None)
+        return self.icon_cache[key]
+
+    def _slots(self):
+        """Visible inventory hitboxes for the current five-item HUD page."""
+        sh = self.screen.get_height()
+        per_page = 5
+        pages = max(1, (len(self.world.inventory) + per_page - 1) // per_page)
+        self.hud_state.inventory_page = max(0, min(self.hud_state.inventory_page, pages - 1))
+        first = self.hud_state.inventory_page * per_page
+        panel_y = sh - 136
+        return [(it, (155 + i * 88, panel_y + 55, 70, 65))
+                for i, it in enumerate(self.world.inventory[first:first + per_page])]
 
     def _slot_at(self, pos):
-        return self.hud.slot_at(self.world.inventory, pos, *self.screen.get_size())
+        for it, (x, y, w, h) in self._slots():
+            if x <= pos[0] < x + w and y <= pos[1] < y + h:
+                return it
+        return None
 
     def _hover_label(self, pos):
         """Text like "Open fridge" / "Use chips with cookie box" for the thing under the mouse."""
         w = self.world
-        if self._in_hud(pos):
+        if pos[1] >= self.screen.get_height() - BAR_H or pos[1] < HUD_H:
             return ""
         x, y = self._to_level(*pos)
         room = w.room_at(x, y)
@@ -199,9 +203,19 @@ class Viewer:
         w = self.world
         wd = w.woody
         sh = self.screen.get_height()
-        if self._in_hud(pos):                                 # interface: inventory tray
+        action = gui.hud_scroll_at(self.screen, pos)
+        if action == "inventory-left":
+            self.hud_state.inventory_page = max(0, self.hud_state.inventory_page - 1)
+            return
+        if action == "inventory-right":
+            pages = max(1, (len(w.inventory) + 4) // 5)
+            self.hud_state.inventory_page = min(pages - 1, self.hud_state.inventory_page + 1)
+            return
+        if pos[1] >= sh - BAR_H:                              # HUD / inventory panel
             it = self._slot_at(pos)
             self.item = None if (it is None or it == self.item) else it
+            return
+        if pos[1] < HUD_H:
             return
         x, y = self._to_level(*pos)
         room = w.room_at(x, y)
@@ -211,8 +225,8 @@ class Viewer:
         if self.item and wd and room:                         # use the picked item here
             r = w.rooms[room]
             target = hit if hit is not None and hit.kind == "object" else None
-            wd.use_item(self.item, target, room, x - r.offset[0], y - r.offset[1])
-            self.item = None
+            if wd.use_item(self.item, target, room, x - r.offset[0], y - r.offset[1]):
+                self.item = None                              # refused (busy entering a hideout): keep it
             return
         if hit is not None:
             self.selected, self.sel_anim = hit, 0
@@ -237,8 +251,7 @@ class Viewer:
         K = pygame
         w = self.world
         if key == K.K_ESCAPE:
-            self.menu.started, self.menu.page, self.state = True, "main", "menu"
-            return True
+            return False
         if key == K.K_TAB:
             self.mode = "camera" if self.mode == "overview" else "overview"
         elif key == K.K_RIGHT:
@@ -257,6 +270,8 @@ class Viewer:
             self._load()
         elif key == K.K_SPACE:
             w.paused = not w.paused
+        elif key == K.K_n:                          # neighbour / pets AI on or off
+            w.ai = not w.ai
         elif key == K.K_m:
             self.music_on = not self.music_on; self._music()
         elif key in (K.K_f, K.K_c):
@@ -290,25 +305,75 @@ class Viewer:
                 x0, y0 = self._to_screen(r[0], r[1])
                 pygame.draw.rect(self.screen, (255, 220, 60),
                                  (int(x0), int(y0), int(r[2] * self.scale), int(r[3] * self.scale)), 2)
+        self._draw_progress()
         self._draw_overlays(sw, sh)
         w = self.world
         wd = w.woody
+        title = f"{self.names[self.level_idx]}   Woody: {wd.room if wd else '-'}" \
+                f"   {'overview' if self.mode == 'overview' else 'camera ' + ('follows' if self.follow else 'free')}"
+        title += "   [paused]" if w.paused else ""
+        title += "" if w.ai else "   [AI off]"
+        self.screen.blit(self.big.render(title, True, (240, 240, 240)), (10, 6))
+        secs = int(w.time_left / ANIM_FPS)
+        status = f"Rating {int(w.score)}" + (f"/{w.minquota}" if w.minquota else "") \
+                 + (f"    Time {secs // 60}:{secs % 60:02d}" if w.time_left else "") + f"    Lives {w.lives}"
+        st = self.big.render(status, True, (255, 226, 120))
+        self.screen.blit(st, (sw - st.get_width() - 12, 6))
+        self._draw_toast_and_end(sw, sh)
         hover = self._hover_label(pygame.mouse.get_pos())
         if hover:
             info = hover
         elif self.item:
-            info = f"Use {w.item_name(self.item)} with ...   (right click cancels)"
+            info = f"Use {w.item_name(self.item)} with ...  (click an object or the floor, right click cancels)"
         elif self.selected is not None:
             names = self.selected.anim_names()
             cur = names[self.sel_anim % len(names)] if names else "-"
-            info = f"{self.selected.label()}   anim: {self.selected.anim}  next: {cur}  (, . Enter)"
+            info = f"{self.selected.label()} ({self.selected.kind})  playing: {self.selected.anim}   " \
+                   f"next animation: {cur}  (, . change, Enter play)"
         else:
-            info = "Click to walk, open, look. Pick an item, then click an object."
-        progress = min(1.0, w.score / 100.0)
-        mood = 1 + min(3, int(progress * 4))
-        name = self.names[self.level_idx] + ("  [paused]" if w.paused else "")
-        self.hud.draw(self.screen, w.inventory, self.item, info, progress, mood, pygame.mouse.get_pos(), name)
+            info = "click: walk / door / open / look   inventory: click an item, then an object   " \
+                   "arrows: scroll  C: follow  wheel: zoom  Tab: overview  PgUp/PgDn: level  M: music"
+        self.screen.blit(self.font.render(info, True, (190, 190, 200)), (10, 34))
         pygame.display.flip()
+
+    def _draw_toast_and_end(self, sw, sh):
+        w = self.world
+        if w.toasts:
+            self.toast = (w.toasts.pop(), 2.0)
+        if self.toast and self.toast[1] > 0:
+            t = self.big.render("TV rating " + self.toast[0], True, (255, 226, 120))
+            self.screen.blit(t, ((sw - t.get_width()) // 2, HUD_H + 56))
+        if w.finished:
+            msg = {"won": "EPISODE COMPLETE!", "lost": "THE NEIGHBOUR WINS THIS ONE"}[w.finished]
+            sub = f"Rating {int(w.score)}" + (f" of {w.minquota} needed" if w.minquota else "") \
+                  + "   -   R: play again   PgDn: next level"
+            a, b = self.big.render(msg, True, (255, 255, 255)), self.font.render(sub, True, (230, 230, 230))
+            bw = max(a.get_width(), b.get_width()) + 60
+            bx, by = (sw - bw) // 2, sh // 2 - 50
+            pygame.draw.rect(self.screen, (30, 24, 20), (bx, by, bw, 90))
+            pygame.draw.rect(self.screen, (255, 226, 120), (bx, by, bw, 90), 3)
+            self.screen.blit(a, (bx + (bw - a.get_width()) // 2, by + 16))
+            self.screen.blit(b, (bx + (bw - b.get_width()) // 2, by + 54))
+
+    def _draw_progress(self):
+        """Trick progress bar above Woody's head, at the 'progressbar' hotspot from
+        objects.xml. Shown only while he prepares a trick on an object - not when he
+        just puts something (marbles, banana, soap ...) on the floor."""
+        wd = self.world.woody
+        if wd is None or getattr(wd, "progress", None) is None or not wd.visible:
+            return
+        hs = (wd.objdef.hotspots.get("progressbar") if wd.objdef else None) or (-30, -130)
+        x, y = self._to_screen(wd.origin[0] + wd.x + hs[0], wd.origin[1] + wd.y + hs[1])
+        bar_x, bar_y = int(x), int(y)
+        if self.hud_state.image("ingame_progress_back") is not None:
+            gui.draw_progress(self.screen, self.hud_state, wd.progress, bar_x, bar_y, self.scale)
+        else:
+            bw = max(24, int(60 * self.scale))          # fallback when the artwork pack is absent
+            bh = max(4, int(7 * self.scale))
+            pygame.draw.rect(self.screen, (24, 20, 16), (bar_x, bar_y, bw, bh))
+            pygame.draw.rect(self.screen, (94, 196, 80),
+                             (bar_x + 1, bar_y + 1, int((bw - 2) * wd.progress), bh - 2))
+            pygame.draw.rect(self.screen, (240, 232, 200), (bar_x, bar_y, bw, bh), 1)
 
     def _wrap(self, text, width):
         lines, cur = [], ""
@@ -323,12 +388,20 @@ class Viewer:
 
     def _draw_overlays(self, sw, sh):
         w = self.world
+        # Original-style HUD and five-item paged inventory.
+        mouse = pygame.mouse.get_pos()
+        slot_states = {it: ("pres" if it == self.item else "norm") for it in w.inventory}
+        for it, (x, y, iw, ih) in self._slots():
+            if it != self.item and x <= mouse[0] < x + iw and y <= mouse[1] < y + ih:
+                slot_states[it] = "hov"
+        item_images = [self._icon(it, slot_states[it]) for it in w.inventory]
+        gui.draw_hud(self.screen, w, self.hud_state, item_images)
         # Woody's comment
         if w.message:
             lines = self._wrap(w.message[0], max(200, sw - 120))
             lh = 30
             bw = max(self.big.size(l)[0] for l in lines) + 28
-            bx, by = (sw - bw) // 2, 14
+            bx, by = (sw - bw) // 2, HUD_H + 8
             pygame.draw.rect(self.screen, (250, 246, 225), (bx, by, bw, lh * len(lines) + 12))
             pygame.draw.rect(self.screen, (60, 50, 40), (bx, by, bw, lh * len(lines) + 12), 2)
             for i, l in enumerate(lines):
@@ -343,40 +416,20 @@ class Viewer:
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     running = False
-                elif self.state == "menu":
-                    act = self.menu.event(ev)
-                    if act and act[0] == "quit":
-                        running = False
-                    elif act and act[0] == "resume":
-                        self.state = "game"
-                    elif act and act[0] == "start":
-                        self.level_idx = self.names.index(act[1])
-                        self._load()
-                        self.menu.started, self.state = True, "game"
                 elif ev.type == pygame.KEYDOWN:
                     running = self._key(ev.key) and running
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     self._click(ev.pos)
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 3:
                     self.item = None
-                elif wheel is not None and ev.type == wheel and self.hud.wheel(
-                        self.world.inventory, pygame.mouse.get_pos(), *self.screen.get_size(), ev.y):
-                    pass
                 elif wheel is not None and ev.type == wheel:
                     self.view_h = min(max(self.view_h * (0.9 if ev.y > 0 else 1.1), 300), 995)
-            if self.state == "menu":
-                self.menu.draw(self.screen)
-                pygame.display.flip()
-                continue
             w = self.world
+            if w.woody is not None and hasattr(pygame, "key"):       # hold Shift: Woody sneaks (silent)
+                w.woody.sneak = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            if self.toast:
+                self.toast = (self.toast[0], self.toast[1] - dt)
             w.update(dt)
-            if not w.paused:
-                self.elapsed += dt
-            if self._level_over():
-                continue
-            if w.caught:
-                self._load()
-                continue
             if self.follow and self.mode == "camera":          # smooth scrolling after Woody
                 tx, ty = self._woody_point()
                 k = min(1.0, dt * 4)
@@ -388,6 +441,50 @@ class Viewer:
                     self._play(snd)
             self._draw()
         pygame.quit()
+
+
+def _scan(roots, depth=4):
+    """Yield every directory below `roots` (breadth first, limited depth)."""
+    seen = set()
+    for root in roots:
+        root = os.path.abspath(root)
+        queue = [(root, 0)]
+        while queue:
+            d, lvl = queue.pop(0)
+            if d in seen or not os.path.isdir(d):
+                continue
+            seen.add(d)
+            yield d
+            if lvl >= depth:
+                continue
+            try:
+                for name in sorted(os.listdir(d)):
+                    if name.startswith(".") or name in ("__pycache__", "nfh", "tools", "examples"):
+                        continue
+                    queue.append((os.path.join(d, name), lvl + 1))
+            except OSError:
+                pass
+
+
+def discover(png=None, tga=None, sfx=None):
+    """Resolve the asset folders: explicit arguments first, then search around the current folder
+    and the project folder (so nested folders like NFH1/NFH1 and unzipped archives are found)."""
+    project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    explicit = [p for p in (png, tga, sfx) if p]
+    roots = explicit + [os.getcwd(), project, os.path.dirname(project)]
+    found = {"png": None, "tga": None, "sfx": None}
+    wanted_png, wanted_tga, wanted_sfx = png, tga, sfx
+    for d in _scan(roots):
+        kind = _sprite_kind(d)
+        if kind and not found[kind]:
+            found[kind] = d
+        if _sound_root(d):
+            if not found["sfx"] or ("high" in os.path.basename(d).lower()
+                                    and "high" not in os.path.basename(found["sfx"]).lower()):
+                found["sfx"] = d
+        if all(found.values()) and not explicit:
+            break
+    return found
 
 
 def _scan(roots, depth=4):
@@ -416,45 +513,32 @@ def _scan(roots, depth=4):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Neighbours From Hell viewer")
-    ap.add_argument("--game", help="the original game's data folder (the one with gamedata.bnd, gfxdata.bnd, "
-                                   "sfxdata.bnd); XML, sprites and sounds are then read from the originals")
-    ap.add_argument("--png", help="folder with PNG sprites (preferred over the originals' .tga)")
-    ap.add_argument("--tga", help="folder or .bnd with the original .tga sprites (gfxdata)")
-    ap.add_argument("--sfx", help="folder or .bnd with the sounds (sfxdata / sfxdatahigh)")
-    ap.add_argument("--no-original", action="store_true", help="do not look for an installed original game")
+    ap.add_argument("--png", help="folder with the PNG sprites (the one that directly contains anc/, kit/, gui/ ...)")
+    ap.add_argument("--tga", help="folder with the original .tga sprites (gfxdata)")
+    ap.add_argument("--sfx", help="sound folder (sfxdata or sfxdatahigh); default: sfxdatahigh if found")
     ap.add_argument("--level", default="level_pig")
     ap.add_argument("--size", default="1280x760")
     a = ap.parse_args(argv)
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     roots = [os.getcwd(), here, os.path.dirname(here)]
     f_png, f_tga, f_sfx = _scan(roots)
-
-    src = None
-    if not a.no_original:
-        d = find_data_dir(a.game)
-        if a.game and d is None:
-            sys.exit(f"--game: no gamedata.bnd found in {os.path.abspath(a.game)} (or its data/ folder)")
-        if d:
-            src = Source(d)
-            game_data.use(src)                         # all XML now comes from the original gamedata.bnd
-
     png = a.png or (f_png[0] if f_png else None)
-    tga = a.tga or (src.gfx if src and src.gfx else (f_tga[0] if f_tga else None))
-    sfx = a.sfx or (src.sfx if src and src.sfx else None)
+    tga = a.tga or (f_tga[0] if f_tga else None)
+    sfx = a.sfx
     if not sfx and f_sfx:
         sfx = next((p for p in f_sfx if "high" in os.path.basename(p).lower()), f_sfx[0])
     for label, path in (("png", png), ("tga", tga)):
-        if path and not os.path.exists(path):
-            sys.exit(f"--{label} does not exist: {os.path.abspath(path)}")
+        if path and not os.path.isdir(path):
+            sys.exit(f"--{label} folder does not exist: {os.path.abspath(path)}")
     if not png and not tga:
         sys.exit("No sprites found.\n"
-                 "Point the viewer at the original game:  python play.py --game <folder with gamedata.bnd>\n"
-                 "or at unpacked sprites:  python play.py --png <folder that directly contains anc, kit, gui ...>\n"
-                 "Searched (4 levels deep) in:\n  " + "\n  ".join(roots))
-    print("data   :", src.dir if src else "bundled copies (converted from the editor's basegame mod)")
-    print("sprites:", png or tga, "\nsounds :", sfx)
+                 "Searched (4 levels deep) in:\n  " + "\n  ".join(roots) + "\n"
+                 "Unzip NFH1.zip (and/or gfxdata.zip) somewhere, then run:\n"
+                 "  python play.py --png <folder that directly contains anc, kit, gui, house ...>\n"
+                 "Tip: for NFH1.zip that is usually the inner NFH1/NFH1 folder.")
+    print("sprites (png):", png, "\nsprites (tga):", tga, "\nsounds:", sfx)
     w, h = (int(v) for v in a.size.lower().split("x"))
-    Viewer(SpriteBank(png, tga), SoundBank(sfx if sfx and os.path.exists(sfx) else None), a.level, (w, h)).run()
+    Viewer(SpriteBank(png, tga), SoundBank(sfx if sfx and os.path.isdir(sfx) else None), a.level, (w, h)).run()
 
 
 if __name__ == "__main__":

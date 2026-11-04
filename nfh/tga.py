@@ -16,32 +16,9 @@ def _expand(v, bits):
     return ((v << (8 - bits)) | (v >> (2 * bits - 8))).astype(np.uint8)
 
 
-def _unrle(data: bytes, off: int, px: int, count: int) -> bytes:
-    """Expand run-length encoded pixel data (TGA image type 10) to `count` raw pixels."""
-    out = bytearray()
-    n = 0
-    while n < count and off < len(data):
-        head = data[off]
-        off += 1
-        run = (head & 0x7F) + 1
-        if head & 0x80:
-            out += data[off:off + px] * run
-            off += px
-        else:
-            out += data[off:off + px * run]
-            off += px * run
-        n += run
-    return bytes(out[:count * px])
-
-
 def decode_tga(data: bytes) -> np.ndarray:
     """Return an (h, w, 4) uint8 RGBA array."""
     idlen, cmap, itype = data[0], data[1], data[2]
-    if itype == 10 and not cmap:                            # RLE true colour (most files in gfxdata.bnd)
-        w, h = struct.unpack("<HH", data[12:16])
-        px = data[16] // 8
-        data = data[:2] + b"" + data[3:18 + idlen] + _unrle(data, 18 + idlen, px, w * h)
-        itype = 2
     if cmap or itype != 2:
         raise ValueError(f"unsupported TGA (colour map={cmap}, type={itype})")
     w, h = struct.unpack("<HH", data[12:16])
@@ -68,7 +45,7 @@ def decode_tga(data: bytes) -> np.ndarray:
 
 
 def load_tga(path: str):
-    """Load a game .tga (a file or 'archive.bnd@@name') as a Pillow RGBA image."""
+    """Load a game .tga as a Pillow RGBA image."""
     from PIL import Image
-    from .source import read_path
-    return Image.fromarray(decode_tga(read_path(path)), "RGBA")
+    with open(path, "rb") as f:
+        return Image.fromarray(decode_tga(f.read()), "RGBA")

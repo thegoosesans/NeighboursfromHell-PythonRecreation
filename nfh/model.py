@@ -69,31 +69,6 @@ def level_sets() -> List[LevelSet]:
             [LevelInfo(l["name"], l.get("state", ""), as_int(l.get("reachable")),
                        as_int(l.get("minquota")), as_int(l.get("time")))
              for l in s.findall("level")]))
-    return _with_unlisted(sets)
-
-
-def _with_unlisted(sets: List["LevelSet"]) -> List["LevelSet"]:
-    """A leveldata.xml that lists fewer levels than the data folder holds (test builds) hides them; levels
-    found in the data source but missing from the list are added to their set from the bundled leveldata."""
-    src = getattr(data, "_source", None)
-    if src is None:
-        return sets
-    have = {l.name.lower() for s in sets for l in s.levels}
-    try:
-        from .data import leveldata as bundled
-        ref = {l["name"].lower(): (s["name"], l) for s in bundled.ROOTS[0] for l in s.findall("level")}
-    except ImportError:
-        ref = {}
-    by_name = {s.name: s for s in sets}
-    for d in src.level_dirs():
-        if d.lower() in have:
-            continue
-        set_name, l = ref.get(d.lower(), ("set01", None))
-        target = by_name.get(set_name) or sets[0]
-        info = LevelInfo(d, l.get("state", "playable") if l else "playable", as_int(l.get("reachable")) if l else 0,
-                         as_int(l.get("minquota"), 60) if l else 60, as_int(l.get("time"), 3600) if l else 3600)
-        info.state = "playable"                       # the data is there, so it can be played
-        target.levels.append(info)
     return sets
 
 
